@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background-color:#f0f0f0;font-family:Arial,Helvetica,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f0f0f0;padding:24px 0;">
+<tr><td align="center">
+<table role="presentation" width="680" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border:1px solid #d2d2d2;">
+
+<tr><td style="background-color:#cc0000;padding:16px 24px;">
+  <img src="https://static.redhat.com/libs/redhat/brand-assets/2/corp/logo.png" alt="Red Hat" height="24" style="display:block;">
+</td></tr>
+
+<tr><td style="padding:24px;">
+  <h1 style="margin:0 0 4px 0;font-size:20px;color:#151515;">AAP Log & Audit Report</h1>
+  <p style="margin:0 0 20px 0;color:#6a6e73;font-size:13px;">
+    Window: last {{ report_lookback_hours }}h (since {{ cutoff_ts }}) &middot; Generated {{ report_generated_at }} &middot; Source: {{ aap_base_url }}
+  </p>
+
+  <table role="presentation" width="100%" cellpadding="8" cellspacing="0" style="margin-bottom:20px;">
+    <tr>
+      <td style="background:#f5f5f5;border:1px solid #e0e0e0;text-align:center;">
+        <div style="font-size:22px;font-weight:bold;color:#151515;">{{ jobs_total_count }}</div>
+        <div style="font-size:12px;color:#6a6e73;">job runs</div>
+      </td>
+      <td style="background:#f5f5f5;border:1px solid #e0e0e0;text-align:center;">
+        <div style="font-size:22px;font-weight:bold;color:{{ '#c9190b' if (status_counts.failed | default(0)) + (status_counts.error | default(0)) > 0 else '#151515' }};">
+          {{ (status_counts.failed | default(0)) + (status_counts.error | default(0)) }}
+        </div>
+        <div style="font-size:12px;color:#6a6e73;">failed / errored</div>
+      </td>
+      <td style="background:#f5f5f5;border:1px solid #e0e0e0;text-align:center;">
+        <div style="font-size:22px;font-weight:bold;color:#151515;">{{ activity_total_count }}</div>
+        <div style="font-size:12px;color:#6a6e73;">audit events</div>
+      </td>
+    </tr>
+  </table>
+
+  {% if jobs_truncated %}
+  <p style="background:#fdf2f2;border:1px solid #c9190b;padding:8px 12px;font-size:12px;color:#c9190b;">
+    Job list truncated to the first {{ jobs_page_size }} of {{ jobs_total_count }} results for this window — shorten <code>report_lookback_hours</code> or run the report more frequently for full coverage.
+  </p>
+  {% endif %}
+  {% if activity_truncated %}
+  <p style="background:#fdf2f2;border:1px solid #c9190b;padding:8px 12px;font-size:12px;color:#c9190b;">
+    Activity stream truncated to the first {{ activity_page_size }} of {{ activity_total_count }} results for this window — shorten <code>report_lookback_hours</code> or run the report more frequently for full coverage.
+  </p>
+  {% endif %}
+
+  <h2 style="font-size:15px;color:#151515;border-bottom:2px solid #cc0000;padding-bottom:4px;">Job Status Breakdown</h2>
+  <table role="presentation" width="100%" cellpadding="6" cellspacing="0" style="font-size:13px;margin-bottom:20px;">
+    <tr style="background:#151515;color:#ffffff;"><td>Status</td><td align="right">Count</td></tr>
+    {% for status, count in status_counts.items() %}
+    <tr style="background:{{ '#ffffff' if loop.index is even else '#f5f5f5' }};">
+      <td style="padding:4px 8px;">{{ status }}</td>
+      <td style="padding:4px 8px;" align="right">{{ count }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  {% if top_failure_templates %}
+  <h2 style="font-size:15px;color:#151515;border-bottom:2px solid #cc0000;padding-bottom:4px;">Top Failing Job Templates</h2>
+  <table role="presentation" width="100%" cellpadding="6" cellspacing="0" style="font-size:13px;margin-bottom:20px;">
+    <tr style="background:#151515;color:#ffffff;"><td>Template</td><td align="right">Failures</td></tr>
+    {% for name, count in top_failure_templates %}
+    <tr style="background:{{ '#ffffff' if loop.index is even else '#f5f5f5' }};">
+      <td style="padding:4px 8px;">{{ name }}</td>
+      <td style="padding:4px 8px;" align="right">{{ count }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+
+  {% if failed_job_details %}
+  <h2 style="font-size:15px;color:#151515;border-bottom:2px solid #cc0000;padding-bottom:4px;">Failed Job Detail (most recent {{ failed_job_details | length }})</h2>
+  {% for job in failed_job_details %}
+  <div style="border:1px solid #e0e0e0;margin-bottom:10px;">
+    <div style="background:#f5f5f5;padding:6px 10px;font-size:13px;">
+      <strong>{{ job.name }}</strong> — {{ job.status }} — finished {{ job.finished }}
+      &middot; <a href="{{ job.ui_url }}" style="color:#06c;">view in AAP</a>
+    </div>
+    {% if job.job_explanation %}
+    <div style="padding:6px 10px;font-size:12px;color:#6a6e73;">{{ job.job_explanation }}</div>
+    {% endif %}
+    <pre style="margin:0;padding:10px;background:#151515;color:#e0e0e0;font-size:11px;overflow-x:auto;white-space:pre-wrap;">{{ job.stdout_tail }}</pre>
+  </div>
+  {% endfor %}
+  {% endif %}
+
+  <h2 style="font-size:15px;color:#151515;border-bottom:2px solid #cc0000;padding-bottom:4px;">Audit Trail — Operations</h2>
+  <table role="presentation" width="100%" cellpadding="6" cellspacing="0" style="font-size:13px;margin-bottom:20px;">
+    <tr style="background:#151515;color:#ffffff;"><td>Operation</td><td align="right">Count</td></tr>
+    {% for op, count in activity_op_counts.items() %}
+    <tr style="background:{{ '#ffffff' if loop.index is even else '#f5f5f5' }};">
+      <td style="padding:4px 8px;">{{ op }}</td>
+      <td style="padding:4px 8px;" align="right">{{ count }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <h2 style="font-size:15px;color:#151515;border-bottom:2px solid #cc0000;padding-bottom:4px;">Audit Trail — Most Active Users</h2>
+  <table role="presentation" width="100%" cellpadding="6" cellspacing="0" style="font-size:13px;margin-bottom:20px;">
+    <tr style="background:#151515;color:#ffffff;"><td>User</td><td align="right">Events</td></tr>
+    {% for actor, count in activity_top_actors %}
+    <tr style="background:{{ '#ffffff' if loop.index is even else '#f5f5f5' }};">
+      <td style="padding:4px 8px;">{{ actor }}</td>
+      <td style="padding:4px 8px;" align="right">{{ count }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <p style="font-size:11px;color:#6a6e73;border-top:1px solid #e0e0e0;padding-top:10px;">
+    Full job-run and activity-stream records for this window are attached as JSON — AAP prunes job history and the activity stream on its own retention schedule, so these attachments are the durable copy for audit/compliance purposes.
+  </p>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body>
+</html>

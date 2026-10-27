@@ -1,0 +1,145 @@
+---
+- name: Generate AAP job/audit log report and email it
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    report_lookback_hours: 168
+    recipient_email: "kenelson@redhat.com"
+    jobs_page_size: 200
+    activity_page_size: 200
+    failed_statuses: ["failed", "error", "canceled"]
+    max_failed_detail: 15
+    failed_stdout_tail_lines: 60
+    aap_base_url: >-
+      {{ (aap_hostname if aap_hostname.startswith('http') else 'https://' ~ aap_hostname)
+         | regex_replace('/$', '') }}
+    aap_verify_certs: "{{ aap_validate_certs | default(false) | bool }}"
+
+  tasks:
+    - name: Compute report window cutoff (UTC)
+      ansible.builtin.command: date -u -d "-{{ report_lookback_hours }} hours" +%Y-%m-%dT%H:%M:%SZ
+      register: cutoff_cmd
+      changed_when: false
+
+    - name: Set report window facts
+      ansible.builtin.set_fact:
+        cutoff_ts: "{{ cutoff_cmd.stdout }}"
+        report_generated_at: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Query job runs since cutoff
+      ansible.builtin.uri:
+        url: "{{ aap_base_url }}/api/controller/v2/unified_jobs/?finished__gte={{ cutoff_ts }}&order_by=-finished&page_size={{ jobs_page_size }}"
+        headers:
+          Authorization: "Bearer {{ aap_token }}"
+        validate_certs: "{{ aap_verify_certs }}"
+        return_content: true
+      register: jobs_resp
+
+    - name: Query activity stream since cutoff
+      ansible.builtin.uri:
+        url: "{{ aap_base_url }}/api/controller/v2/activity_stream/?timestamp__gte={{ cutoff_ts }}&order_by=-timestamp&page_size={{ activity_page_size }}"
+        headers:
+          Authorization: "Bearer {{ aap_token }}"
+        validate_certs: "{{ aap_verify_certs }}"
+        return_content: true
+      register: activity_resp
+
+    - name: Set raw result facts
+      ansible.builtin.set_fact:
+        jobs_results: "{{ jobs_resp.json.results }}"
+        jobs_total_count: "{{ jobs_resp.json.count }}"
+        jobs_truncated: "{{ jobs_resp.json.count > (jobs_resp.json.results | length) }}"
+        activity_results: "{{ activity_resp.json.results }}"
+        activity_total_count: "{{ activity_resp.json.count }}"
+        activity_truncated: "{{ activity_resp.json.count > (activity_resp.json.results | length) }}"
+
+    - name: Select failed/error/canceled jobs for stdout detail
+      ansible.builtin.set_fact:
+        failed_jobs_to_detail: "{{ (jobs_results | selectattr('status', 'in', failed_statuses) | list)[:max_failed_detail] }}"
+
+    - name: Fetch stdout tail for failed jobs
+      ansible.builtin.uri:
+        url: "{{ aap_base_url }}{{ item.related.stdout }}?format=txt"
+        headers:
+          Authorization: "Bearer {{ aap_token }}"
+        validate_certs: "{{ aap_verify_certs }}"
+        return_content: true
+      loop: "{{ failed_jobs_to_detail }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.id }})"
+      register: failed_stdout_raw
+      when: item.related.stdout is defined
+
+    - name: Build failed job detail list with truncated stdout
+      ansible.builtin.set_fact:
+        failed_job_details: >-
+          {{ failed_job_details | default([]) + [{
+            'id': item.item.id,
+            'name': item.item | job_display_name,
+            'status': item.item.status,
+            'finished': item.item.finished,
+            'job_explanation': item.item.job_explanation | default(''),
+            'ui_url': aap_base_url ~ '/#/jobs/' ~ item.item.id ~ '/output',
+            'stdout_tail': (item.content | default('') | tail_lines(failed_stdout_tail_lines))
+          }] }}
+      loop: "{{ failed_stdout_raw.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.item is defined
+
+    - name: Compute summary stats
+      ansible.builtin.set_fact:
+        status_counts: "{{ jobs_results | status_counts }}"
+        top_failure_templates: "{{ jobs_results | selectattr('status', 'in', failed_statuses) | list | top_failures(10) }}"
+        activity_op_counts: "{{ activity_results | activity_by_operation }}"
+        activity_top_actors: "{{ activity_results | activity_by_actor(10) }}"
+
+    - name: Render HTML report/email body
+      ansible.builtin.set_fact:
+        report_html: "{{ lookup('template', 'report_email.html.j2') }}"
+
+    - name: Create scratch directory for report attachments
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: aap-log-report
+      register: report_tmpdir
+
+    - name: Write job run export (JSON)
+      ansible.builtin.copy:
+        content: "{{ jobs_results | to_nice_json }}"
+        dest: "{{ report_tmpdir.path }}/jobs_{{ cutoff_ts }}.json"
+
+    - name: Write activity stream export (JSON)
+      ansible.builtin.copy:
+        content: "{{ activity_results | to_nice_json }}"
+        dest: "{{ report_tmpdir.path }}/activity_stream_{{ cutoff_ts }}.json"
+
+    - name: Email the report
+      community.general.mail:
+        host: "{{ lookup('env', 'SMTP_HOST') }}"
+        port: "{{ lookup('env', 'SMTP_PORT') }}"
+        username: "{{ lookup('env', 'SMTP_USERNAME') }}"
+        password: "{{ lookup('env', 'SMTP_PASSWORD') }}"
+        secure: "{{ lookup('env', 'SMTP_SECURE') }}"
+        from: "{{ lookup('env', 'SMTP_FROM') }}"
+        to: "{{ recipient_email }}"
+        subject: "AAP Log & Audit Report — {{ jobs_total_count }} jobs, {{ activity_total_count }} audit events ({{ report_lookback_hours }}h window)"
+        subtype: html
+        body: "{{ report_html }}"
+        attach:
+          - "{{ report_tmpdir.path }}/jobs_{{ cutoff_ts }}.json"
+          - "{{ report_tmpdir.path }}/activity_stream_{{ cutoff_ts }}.json"
+      when: lookup('env', 'SMTP_HOST') | length > 0
+
+    - name: Warn if SMTP is not configured
+      ansible.builtin.debug:
+        msg: "SMTP_HOST not set (no SMTP Relay credential attached) — report generated but not emailed."
+      when: lookup('env', 'SMTP_HOST') | length == 0
+
+    - name: Clean up scratch directory
+      ansible.builtin.file:
+        path: "{{ report_tmpdir.path }}"
+        state: absent
+      when: report_tmpdir.path is defined

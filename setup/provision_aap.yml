@@ -1,0 +1,168 @@
+---
+- name: Provision the AAP Log & Audit Report project/job template/schedule
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    organization_name: Default
+    inventory_name: Demo Inventory
+    project_name: "AAP Log Report"
+    project_scm_url: "http://192.168.2.22:3000/krbn/aap-log-report.git"
+    job_template_name: "AAP Log & Audit Report"
+    smtp_credential_name: "SMTP Relay (Gmail)"
+    schedule_name: "AAP Log & Audit Report - weekly"
+    # Sundays 20:00 UTC — ahead of both built-in cleanup system jobs (Cleanup Job Details
+    # runs Sundays 21:54 UTC, Cleanup Activity Stream runs Tuesdays 21:54 UTC), so this
+    # report always captures the week's data before either prunes anything. See README.
+    schedule_rrule: "DTSTART:20261025T200000Z RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=SU"
+
+  tasks:
+    - name: Look up the job template (may not exist yet)
+      ansible.builtin.uri:
+        url: "{{ controller_host }}/api/controller/v2/job_templates/?name={{ job_template_name | urlencode }}"
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+        return_content: true
+      register: jt_lookup
+
+    # Discovered by credential_type (namespace "controller" = the built-in "Red Hat Ansible
+    # Automation Platform" type), not by a fixed name — whoever creates this credential may
+    # name it anything. Guessing a fixed name here previously caused the job_template task
+    # below to silently drop whatever was actually attached on every re-run.
+    - name: Look up any self-API credential already attached to the job template
+      ansible.builtin.uri:
+        url: "{{ controller_host }}/api/controller/v2/job_templates/{{ jt_lookup.json.results[0].id }}/credentials/?credential_type__namespace=controller"
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+        return_content: true
+      register: self_api_cred_lookup
+      when: (jt_lookup.json.count | default(0)) > 0
+
+    - name: Set self-API credential facts
+      ansible.builtin.set_fact:
+        self_api_credential_exists: "{{ (self_api_cred_lookup.json.count | default(0)) > 0 }}"
+        self_api_credential_id: "{{ self_api_cred_lookup.json.results[0].id | default(omit) }}"
+
+    - name: Create/update the project
+      ansible.controller.project:
+        name: "{{ project_name }}"
+        organization: "{{ organization_name }}"
+        scm_type: git
+        scm_url: "{{ project_scm_url }}"
+        scm_update_on_launch: true
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+      register: project_result
+
+    - name: Wait for initial project sync
+      ansible.controller.project_update:
+        name: "{{ project_name }}"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+        wait: true
+      when: project_result.changed
+
+    - name: Create/update the job template (incl. survey)
+      ansible.controller.job_template:
+        name: "{{ job_template_name }}"
+        description: "Pulls AAP job-run logs + activity stream for the configured window and emails a reporting/audit digest."
+        organization: "{{ organization_name }}"
+        project: "{{ project_name }}"
+        playbook: playbooks/generate_log_report.yml
+        job_type: run
+        inventory: "{{ inventory_name }}"
+        ask_variables_on_launch: false
+        survey_enabled: true
+        survey_spec:
+          name: ""
+          description: ""
+          spec:
+            - question_name: "Report lookback window (hours)"
+              variable: report_lookback_hours
+              type: integer
+              default: 168
+              min: 1
+              max: 8760
+              required: true
+            - question_name: "Recipient email"
+              variable: recipient_email
+              type: text
+              default: "kenelson@redhat.com"
+              required: true
+        credentials: "{{ [smtp_credential_name] + ([self_api_credential_id] if self_api_credential_exists else []) }}"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+      register: job_template_result
+
+    - name: Report whether a self-API credential still needs to be attached
+      ansible.builtin.debug:
+        msg: >-
+          No credential of the built-in "Red Hat Ansible Automation Platform" type is attached to
+          '{{ job_template_name }}' yet — create one in the UI (any name), attach it to the job
+          template, and re-run this playbook (it'll be auto-discovered and left alone from then on).
+      when: not self_api_credential_exists
+
+    - name: Re-look-up the job template id (covers the first-ever run where it didn't exist above)
+      ansible.builtin.uri:
+        url: "{{ controller_host }}/api/controller/v2/job_templates/?name={{ job_template_name | urlencode }}"
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+        return_content: true
+      register: jt_lookup
+
+    - name: Check whether the schedule already exists
+      ansible.builtin.uri:
+        url: "{{ controller_host }}/api/controller/v2/job_templates/{{ jt_lookup.json.results[0].id }}/schedules/?name={{ schedule_name | urlencode }}"
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+        return_content: true
+      register: schedule_lookup
+
+    - name: Create the weekly schedule (raw API — ansible.controller.schedule is known-buggy against this AAP version)
+      ansible.builtin.uri:
+        url: "{{ controller_host }}/api/controller/v2/job_templates/{{ jt_lookup.json.results[0].id }}/schedules/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+        status_code: [201]
+        body_format: json
+        body:
+          name: "{{ schedule_name }}"
+          rrule: "{{ schedule_rrule }}"
+          extra_data:
+            report_lookback_hours: 168
+            recipient_email: "kenelson@redhat.com"
+      register: schedule_result
+      when: (schedule_lookup.json.count | default(0)) == 0
+
+    - name: Keep the existing schedule's rrule in sync
+      ansible.builtin.uri:
+        url: "{{ controller_host }}/api/controller/v2/schedules/{{ schedule_lookup.json.results[0].id }}/"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+        status_code: [200]
+        body_format: json
+        body:
+          rrule: "{{ schedule_rrule }}"
+      register: schedule_update_result
+      when: >-
+        (schedule_lookup.json.count | default(0)) > 0 and
+        schedule_lookup.json.results[0].rrule != schedule_rrule
+
+    - name: Show schedule result
+      ansible.builtin.debug:
+        msg: >-
+          {{ schedule_result.json | default(none)
+             or (schedule_update_result.json | default(none))
+             or 'schedule already up to date' }}
