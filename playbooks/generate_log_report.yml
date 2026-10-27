@@ -6,7 +6,7 @@
 
   vars:
     report_lookback_hours: 168
-    recipient_email: "kenelson@redhat.com"
+    recipient_email: "testemail@aol.com"
     jobs_page_size: 200
     activity_page_size: 200
     failed_statuses: ["failed", "error", "canceled"]
